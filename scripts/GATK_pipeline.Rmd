@@ -1,0 +1,283 @@
+---
+title: "GATK postprocessing pipeline"
+author: "Martin Kovacik"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stringr)
+library(DESeq2)
+```
+
+## SNP filtering
+
+SNP filtering on several levels. All files needed are included in data folder.
+
+### Data import
+
+Each dataset is a combination of ploidy (12N, 8N) and parental pair (MOR x HOR, MOR x HS). Every dataset has 3 replicates of 2 reciprocal crosses, e.g. for 12N_MOR_HOR replicate 1: HOR_MOR_12N1 (HOR mother) and MOR_HOR_12N1 (MOR mother).
+
+```{r import}
+datasets <- c("12N_MOR_HOR", "12N_MOR_HS", "8N_MOR_HOR", "8N_MOR_HS")
+replicates <- 1:3
+
+ploidy <- function(ds) str_extract(ds, "^[0-9]+N")
+partner <- function(ds) str_extract(ds, "[^_]+$")
+crosses <- function(ds, r) c(paste0(partner(ds), "_MOR_", ploidy(ds), r), paste0("MOR_", partner(ds), "_", ploidy(ds), r))
+
+SNP <- list()
+for (ds in datasets) {
+  SNP[[ds]] <- read.table(paste0("../data/", ds, "_SNP_exons_annotated.table"), header = TRUE)
+}
+```
+
+### Keep simple SNPs
+
+Deletions and SNPs with more than one ALT alleles were discarded.
+
+```{r deletions removal}
+for (ds in datasets) {
+  SNP[[ds]] <- filter(SNP[[ds]], !str_detect(ALT, ","))
+  print(head(SNP[[ds]], 10))
+}
+```
+
+### Reorganize SNPs
+
+In the first step alleles are reorganized in reciprocal crosses, according to parents (first mother, second father).
+
+```{r reorganize}
+# k-th value of the AD field ("REF,ALT")
+ad_value <- function(ad, k) as.numeric(sapply(str_split(ad, ","), `[`, k))
+
+AD <- list()
+for (ds in datasets) {
+  cols <- list()
+  for (r in replicates) {
+    cr <- crosses(ds, r)
+    ad_1 <- SNP[[ds]][, 8 + 10 * (r - 1)]
+    ad_2 <- SNP[[ds]][, 13 + 10 * (r - 1)]
+    cols[[paste0(cr[1], ".MAT")]] <- ad_value(ad_1, 2)
+    cols[[paste0(cr[1], ".PAT")]] <- ad_value(ad_1, 1)
+    cols[[paste0(cr[2], ".MAT")]] <- ad_value(ad_2, 1)
+    cols[[paste0(cr[2], ".PAT")]] <- ad_value(ad_2, 2)
+  }
+  AD[[ds]] <- as.data.frame(cols)
+}
+```
+
+Resulting table contains allele depths reorganized according to parents (not according to REF and ALT).
+
+### Testing
+
+Test of binomial distribution was perfomed. The null hypothesis is, that the probability of maternal allele in each position is 2/3. If p-val \< 0.05 we can reject this hypothesis. Then alternative hypothesis is, that the probability of maternal allele is not equal to 2/3.
+
+```{r testing}
+BINOM <- list()
+for (ds in datasets) {
+  cols <- list()
+  for (cr in as.vector(sapply(replicates, function(r) crosses(ds, r)))) {
+    mat <- AD[[ds]][[paste0(cr, ".MAT")]]
+    pat <- AD[[ds]][[paste0(cr, ".PAT")]]
+    pval <- mapply(function(m, p) binom.test(c(m, p), p = 2/3)$p.value, mat, pat)
+    cols[[paste0(cr, ".MAT")]] <- mat
+    cols[[paste0(cr, ".PAT")]] <- pat
+    cols[[paste0(cr, ".PADJ")]] <- p.adjust(pval, method = "BH")
+  }
+  BINOM[[ds]] <- as.data.frame(cols)
+  print(head(BINOM[[ds]]))
+}
+```
+
+After test of binomial distribution, it can happen that SNP is imprinted (both p-val \< 0.05), but allele counts points to cultivar-specific expression. The SNP is expressed always from MOR or HOR/HS.
+
+### Bias direction
+
+To claim SNP as imprinted, bias has to be in the same direction for both crosses. In the next step bias is examined and checked for equivalent bias.
+
+```{r bias}
+BIAS <- list()
+for (ds in datasets) {
+  BIAS[[ds]] <- SNP[[ds]][, 1:6]
+  colnames(BIAS[[ds]]) <- c("CHROM", "POS", "REF", "ALT", "QUAL", "GENE")
+  for (r in replicates) {
+    cr <- crosses(ds, r)
+    b <- BINOM[[ds]][, paste0(rep(cr, each = 3), c(".MAT", ".PAT", ".PADJ"))]
+    crs_1 <- (b[, 1] + b[, 2]) / 3
+    crs_2 <- (b[, 4] + b[, 5]) / 3
+    mat_1 <- b[, 1] > 2 * crs_1
+    pat_1 <- b[, 2] > crs_1
+    mat_2 <- b[, 4] > 2 * crs_2
+    pat_2 <- b[, 5] > crs_2
+    b[[paste0(cr[2], ".BIAS")]] <- case_when(mat_1 & mat_2 ~ "MAT",
+                                             pat_1 & pat_2 ~ "PAT",
+                                             mat_1 & pat_2 ~ partner(ds),
+                                             pat_1 & mat_2 ~ "MOR",
+                                             TRUE ~ "NA")
+    BIAS[[ds]] <- cbind(BIAS[[ds]], b)
+  }
+}
+```
+
+### Bias consistency
+
+Not all SNPs in each gene are significant. So far, we reported only significant SNPs, but to consider gene as imprinted, the SNPs should be consistently biased. If all SNPs are significant, situation is clear. If other SNPs are not significant, there should be at least consistent bias.
+
+```{r consistency}
+# Number of SNPs per gene in each bias category
+count_bias <- function(df, bias_col, cats) {
+  counts <- as.data.frame.matrix(table(df$GENE, factor(df[[bias_col]], levels = cats)))
+  data.frame(GENE = rownames(counts), counts, check.names = FALSE)
+}
+
+STATS <- list()
+for (ds in datasets) {
+  stats_reps <- list()
+  for (r in replicates) {
+    cr <- crosses(ds, r)
+    pr <- paste0("X", ploidy(ds), r, "_")
+    bias_col <- paste0(cr[2], ".BIAS")
+    sign <- filter(BIAS[[ds]], .data[[paste0(cr[2], ".PADJ")]] <= 0.05 & .data[[paste0(cr[1], ".PADJ")]] <= 0.05)
+    count <- count_bias(BIAS[[ds]], bias_col, sort(c("MAT", "PAT", "MOR", partner(ds), "NA")))
+    sign <- count_bias(sign, bias_col, c("MAT", "PAT", partner(ds), "MOR"))
+    colnames(count)[-1] <- paste0(pr, colnames(count)[-1])
+    colnames(sign)[-1] <- paste0(pr, colnames(sign)[-1], ".SIGN")
+    stats_reps[[r]] <- merge(count, sign, all.x = TRUE)
+  }
+  STATS[[ds]] <- Reduce(function(x, y) merge(x, y, all = TRUE), stats_reps)
+}
+```
+
+### Bias filter
+
+Genes were filtered to have at least one significant SNPs with MAT or PAT bias and the rest of the SNPs with the same bias although they are not significant.
+
+```{r bias filter}
+BIASED <- list()
+for (ds in datasets) {
+  cats <- c("MAT", "PAT", "MOR", partner(ds))
+  BIASED[[ds]] <- lapply(replicates, function(r) {
+    pr <- paste0("X", ploidy(ds), r, "_")
+    sapply(cats, function(cat) {
+      others <- paste0(pr, setdiff(c(cats, "NA"), cat))
+      keep <- rowSums(STATS[[ds]][, others] != 0) == 0 & STATS[[ds]][[paste0(pr, cat, ".SIGN")]] >= 1
+      STATS[[ds]]$GENE[which(keep)]
+    }, simplify = FALSE)
+  })
+}
+```
+
+### Difference filter
+
+Genes were filtered to have enough difference between parents. For female reads: 10x more than male For male reads: 2.5x more than female
+
+```{r difference}
+mat_dominant <- function(b, cr) b[[paste0(cr, ".MAT")]] > b[[paste0(cr, ".PAT")]] * 10
+pat_dominant <- function(b, cr) b[[paste0(cr, ".PAT")]] > b[[paste0(cr, ".MAT")]] * 2.5
+
+DIFF <- list()
+for (ds in datasets) {
+  b <- BIAS[[ds]]
+  DIFF[[ds]] <- lapply(replicates, function(r) {
+    cr <- crosses(ds, r)
+    keep <- list(MAT = mat_dominant(b, cr[1]) & mat_dominant(b, cr[2]),
+                 PAT = pat_dominant(b, cr[1]) & pat_dominant(b, cr[2]),
+                 MOR = pat_dominant(b, cr[1]) & mat_dominant(b, cr[2]))
+    keep[[partner(ds)]] <- mat_dominant(b, cr[1]) & pat_dominant(b, cr[2])
+    lapply(keep, function(k) unique(b$GENE[which(k)]))
+  })
+}
+```
+
+### Differential expression analysis
+
+Output of this analysis is already preloaded from ddds_con_galore_NCBI.RData
+
+```{r deseq2 analysis}
+counts_galore=read.csv("./data/counts_NCBI.txt", sep = "", head = T, skip = 1, row.names = "Geneid")
+
+colnames(counts_galore)[6:44]
+samples_galore = cbind(colnames(counts_galore)[6:44],
+                       c(rep(c("08_EMB", "16_EMB", "24_EMB", "32_EMB"), each = 3),
+                         rep(c("04_END", "08_END", "16_END", "24_END", "32_END"), each = 3),
+                         rep(c("04_SMT", "08_SMT", "16_SMT", "24_SMT"), each = 3)),
+                       rep(c("08", "16", "24", "32", "04", "08", "16", "24", "32", "04", "08", "16", "24"), each = 3),
+                       rep(c("EMB", "END", "SMT"), c(12, 15, 12)))
+rownames(samples_galore) = samples_galore[,1]
+samples_galore = as.data.frame(samples_galore[,2:4])
+colnames(samples_galore) = c("condition", "age", "tissue")
+
+all(rownames(samples_galore) %in% colnames(counts_galore))
+
+dds_con_galore = DESeqDataSetFromMatrix(countData = counts_galore[,6:44], colData = samples_galore, design = ~condition)
+
+ddds_con_galore = DESeq(dds_con_galore)
+```
+
+### DESeq2 filter
+
+Genes were filtered to have significant differential expression (p-adj \< 0.05 and log2FoldChange \> 0):
+
+| Sample              | Compared to                                    |
+|---------------------|------------------------------------------------|
+| 08_END_MEG (08_END) | 08_EMB, 16_EMB, 04_SMT, 08_SMT, 16_SMT         |
+| 08_END_PEG (08_END) | 08_EMB, 16_EMB                                 |
+| 12_END_MEG (08_END) | 08_EMB, 16_EMB, 04_SMT, 08_SMT, 16_SMT         |
+| 12_END_PEG (08_END) | 08_EMB, 16_EMB                                 |
+
+```{r deseq2 filter}
+# Genes upregulated in 08_END against at least one sample and downregulated against none
+up_08_END <- function(comps) {
+  up <- character()
+  down <- character()
+  for (comp in comps) {
+    res_pair_ddds_galore = results(ddds_con_galore, contrast = c("condition", "08_END", comp), alpha = 0.05)
+    summary(res_pair_ddds_galore)
+    up <- c(up, rownames(subset(res_pair_ddds_galore, padj < 0.05 & log2FoldChange > 0)))
+    down <- c(down, rownames(subset(res_pair_ddds_galore, padj < 0.05 & log2FoldChange < 0)))
+  }
+  setdiff(up, down)
+}
+
+comp_08_END_MEG <- c("08_EMB", "16_EMB", "04_SMT", "08_SMT", "16_SMT")
+comp_08_END_PEG <- c("08_EMB", "16_EMB")
+diff_08_END_MEG <- up_08_END(comp_08_END_MEG)
+diff_08_END_PEG <- up_08_END(comp_08_END_PEG)
+```
+
+### Filtering
+
+Apply all previous filters on dataset of imprinted genes. If gene is classified as imprinted at **2 out of 3** replicates, it is considered as imprinted.
+
+```{r filtering}
+de_filter <- list(MEG = diff_08_END_MEG, PEG = diff_08_END_PEG)
+
+IMPRINTED <- list()
+for (ds in datasets) {
+  classes <- c(MEG = "MAT", PEG = "PAT", MOR = "MOR", setNames(partner(ds), partner(ds)))
+  IMPRINTED[[ds]] <- list()
+  for (cl in names(classes)) {
+    candidates <- character()
+    for (r in replicates) {
+      genes <- intersect(BIASED[[ds]][[r]][[classes[[cl]]]], DIFF[[ds]][[r]][[classes[[cl]]]])
+      if (cl %in% names(de_filter)) genes <- intersect(genes, de_filter[[cl]])
+      candidates <- c(candidates, genes)
+    }
+    freq <- table(candidates)
+    IMPRINTED[[ds]][[cl]] <- as.character(names(freq)[freq >= 3])
+  }
+}
+```
+
+### Data export
+
+```{r export}
+for (ds in datasets) {
+  for (cl in names(IMPRINTED[[ds]])) {
+    write.table(IMPRINTED[[ds]][[cl]], paste0("./", ds, "_", cl, ".txt"), row.names = FALSE, col.names = FALSE, quote = FALSE)
+  }
+}
+```
